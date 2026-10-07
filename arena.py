@@ -23,6 +23,11 @@ Code is never shown to anyone. Results, head-to-heads and replays are public.
     python arena.py --tunnel             ...and open a public cloudflared link
     python arena.py add-team "Name"      register a team, print its key
     python arena.py teams                list teams and keys
+    python arena.py load-keys FILE       add mentor keys from a mentor,key CSV ("-" = stdin)
+    python arena.py keys                 list mentor keys and the team that claimed each
+
+Teams cannot sign up on their own: each needs a key from its mentor, which
+names the team once on the Submit page and is its login from then on.
     python arena.py final                run the final round robin
     python arena.py kit [folder]         write the participant kit (default ../participant-kit)
 
@@ -30,12 +35,17 @@ Environment: DEALS (live deals per fight, default 200), FINAL_DEALS (500),
 COOLDOWN (seconds between uploads, 600), DEADLINE (e.g. 2026-10-08T18:00,
 local time; uploads close then), WORKERS (fights at once, 2), ARENA_DATA
 (folder for the database and uploads), KIT_URL (where teams get the kit;
-defaults to /kit.zip served from here).
+defaults to /kit.zip served from here), MATCH_ISOLATION ("docker" runs each
+fight in its own container via match_runner.py; default in-process),
+MATCH_IMAGE, MATCH_MEMORY (2g), MATCH_CPUS (4), MATCH_WALL_S (3600), ADMIN_KEY
+(turns on the organiser panel at /admin: teams, keys, every upload's code,
+disqualify, rename, reset cooldown, recheck).
 """
 
 from __future__ import annotations
 
 import email.parser
+import gzip
 import email.policy
 import html
 import http.cookies
@@ -43,12 +53,14 @@ import http.server
 import io
 import itertools
 import json
+import math
 import os
 import re
 import secrets
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -61,7 +73,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from bot_loader import check_source  # noqa: E402
-from engine import derive_seed, play_match  # noqa: E402
+from engine import derive_seed  # noqa: E402
 import rules as R  # noqa: E402
 
 DATA = Path(os.environ.get("ARENA_DATA", HERE / "arena_data"))
@@ -73,7 +85,19 @@ COOLDOWN = int(os.environ.get("COOLDOWN", 600))
 DEADLINE = os.environ.get("DEADLINE", "")
 WORKERS = int(os.environ.get("WORKERS", 2))
 KIT_URL = os.environ.get("KIT_URL", "/kit.zip")
+# "docker": every fight runs in its own throwaway container (set by docker-compose.yml).
+# Anything else: in-process, for local runs and tests.
+MATCH_ISOLATION = os.environ.get("MATCH_ISOLATION", "local")
+MATCH_IMAGE = os.environ.get("MATCH_IMAGE", "hiddenhand-arena:latest")
+MATCH_MEMORY = os.environ.get("MATCH_MEMORY", "2g")
+MATCH_CPUS = os.environ.get("MATCH_CPUS", "4")
+MATCH_WALL_S = int(os.environ.get("MATCH_WALL_S", 3600))
+# Organiser panel at /admin, logged into with this key. Empty: no panel at all.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 MAX_BYTES = 100_000
+# Thinking time each bot gets per fight: 30 s per 400 deals played (a live fight
+# is 200 deals both ways round = 400). Scaled to the fight's length.
+THINK_S_PER_400 = 30.0
 HOUSE = ("naive", "reader", "sharp")
 KIT_FILES = ("README.md", "rules.py", "engine.py", "backtester.py", "starter_bot.py",
              "bot_loader.py",
@@ -95,24 +119,37 @@ def secret(name: str) -> int:
     """A hidden seed, made once and kept in the data folder."""
     f = DATA / name
     if not f.exists():
-        f.write_text(str(secrets.randbits(48)))
+        # Workers start together: write a temp file and link it into place, so a
+        # reader never sees a half-written seed and only one seed ever wins.
+        tmp = f.with_name(f"{name}.{secrets.token_hex(4)}")
+        tmp.write_text(str(secrets.randbits(48)))
+        try:
+            os.link(tmp, f)
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink()
     return int(f.read_text())
 
 
 def setup() -> None:
     (DATA / "subs").mkdir(parents=True, exist_ok=True)
+    (DATA / "logs").mkdir(exist_ok=True)
     with db() as con:
         con.execute("pragma journal_mode=wal")
         con.executescript("""
             create table if not exists teams(name text primary key, key text unique, house int default 0);
+            create table if not exists team_keys(key text primary key, mentor text, team text);
             create table if not exists subs(id integer primary key autoincrement, team text, created real,
                 file text, status text, message text default '');
             create table if not exists matches(stage text, a int, b int, pnl_a real, pnl_b real, deals int,
                 notes text, replay text, created real, score_a real, score_b real, primary key(stage, a, b));
         """)
-        for col in ("score_a", "score_b"):  # databases made before scores existed
+        # Columns added after launch: only ever added, so an older arena.py still reads this database.
+        for table, col in (("matches", "score_a real"), ("matches", "score_b real"),
+                           ("teams", "dq int default 0"), ("teams", "cooldown_from real default 0")):
             try:
-                con.execute(f"alter table matches add column {col} real")
+                con.execute(f"alter table {table} add column {col}")
             except sqlite3.OperationalError:
                 pass
         for h in HOUSE:
@@ -124,12 +161,12 @@ def setup() -> None:
 
 
 def entries(con) -> list[sqlite3.Row]:
-    """Every team's newest working file."""
+    """Every team's newest working file. Disqualified teams have none: no board, no new fights."""
     return con.execute("""
         select s.*, t.house,
                (select count(*) from subs x where x.team = s.team and x.status = 'ok' and x.id <= s.id) as version
         from subs s join teams t on t.name = s.team
-        where s.id = (select max(id) from subs where team = s.team and status = 'ok')
+        where s.id = (select max(id) from subs where team = s.team and status = 'ok') and not coalesce(t.dq, 0)
         order by s.id desc""").fetchall()
 
 
@@ -142,23 +179,63 @@ def sub_path(row) -> Path:
 #  FIGHTS
 # ════════════════════════════════════════════════════════════════════
 
-def fight(a, b, deals: int, seed: int) -> dict:
-    """Sandboxed, mirrored match between two subs rows."""
-    from sandbox import SandboxedBot
-    boxes = [SandboxedBot(sub_path(a), f"sub{a['id']}"), SandboxedBot(sub_path(b), f"sub{b['id']}")]
-    try:
-        r = play_match(boxes[0].new_deal, boxes[1].new_deal, n_deals=deals, seed=seed,
-                       names=(a["team"], b["team"]))
-    finally:
-        for box in boxes:
-            box.close()
-    for box, notes in zip(boxes, r["notes"]):
-        for e in box.load_errors:
-            notes[f"could not load: {e}"] = notes.get(f"could not load: {e}", 0) + 1
-    return r
+def fight(a, b, deals: int, seed: int, keep_logs: bool = False) -> dict:
+    """Sandboxed, mirrored match between two subs rows: in its own container, or in-process."""
+    job = {"deals": deals, "seed": seed, "names": [a["team"], b["team"]], "keep_logs": keep_logs,
+           "budget_s": THINK_S_PER_400 * 2 * deals / 400,
+           "bots": [{"name": f"sub{s['id']}", "file": sub_path(s).name,
+                     "source": sub_path(s).read_text(encoding="utf-8")} for s in (a, b)]}
+    if MATCH_ISOLATION != "docker":
+        import match_runner
+        return match_runner.run(job)
+    return fight_in_container(job)
+
+
+def fight_in_container(job: dict) -> dict:
+    """Play a match in a throwaway container: no network, read-only root, no mounts, no capabilities.
+
+    The arena talks to the host's Docker daemon through the mounted socket, so
+    the bot sources go over stdin (a bind mount would be resolved on the host).
+    """
+    name = f"hh-match-{secrets.token_hex(6)}"
+    cpus = min(float(MATCH_CPUS), os.cpu_count() or 1)  # docker refuses more CPUs than the host has
+    cmd = ["docker", "run", "--rm", "-i", "--name", name, "--label", "hiddenhand.match=1",
+           "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+           "--memory", MATCH_MEMORY, "--memory-swap", MATCH_MEMORY, "--cpus", f"{cpus:g}",
+           "--pids-limit", "128", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--user", "arena", "--no-healthcheck",
+           MATCH_IMAGE, "python", "match_runner.py"]
+    # stderr to a file, not a pipe: a bot that prints in a loop must not fill the arena's memory.
+    with tempfile.TemporaryFile() as err:
+        try:
+            p = subprocess.run(cmd, input=json.dumps(job).encode(), stdout=subprocess.PIPE, stderr=err,
+                               timeout=MATCH_WALL_S)
+        except subprocess.TimeoutExpired:
+            # Killing the CLI does not stop the container; remove it (and its anonymous /data volume).
+            subprocess.run(["docker", "rm", "-fv", name], capture_output=True)
+            raise RuntimeError(f"{name} ran over {MATCH_WALL_S}s and was killed") from None
+        if p.returncode != 0:
+            err.seek(max(0, err.tell() - 1000))
+            tail = err.read().decode("utf-8", "replace").strip()
+            raise RuntimeError(f"{name} exited {p.returncode}: {tail}")
+    return json.loads(p.stdout)
+
+
+def log_path(stage: str, a: int, b: int) -> Path:
+    """Every deal of one fight, one JSON object per line. Served only to the two teams in it."""
+    return DATA / "logs" / f"{stage}-{a}-{b}.jsonl.gz"
 
 
 def record(stage: str, a, b, r: dict) -> None:
+    logs = r.pop("logs", None)
+    if logs is not None:
+        # Written before the result, and swapped in whole, so a recorded fight never has half a log.
+        p = log_path(stage, a["id"], b["id"])
+        tmp = p.with_name(p.name + ".tmp")
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            for log in logs:
+                f.write(json.dumps(log, separators=(",", ":")) + "\n")
+        os.replace(tmp, p)
     with db() as con:
         con.execute("insert or replace into matches(stage, a, b, pnl_a, pnl_b, deals, notes, replay, created,"
                     " score_a, score_b) values(?,?,?,?,?,?,?,?,?,?,?)",
@@ -169,6 +246,14 @@ def record(stage: str, a, b, r: dict) -> None:
 TIME_ERROR = (f"Time limit exceeded: a call took over {R.HARD_TIME_LIMIT_MS:.0f} ms. That action counted as "
               "doing nothing, and a call that runs far over or never returns puts your bot out for the rest "
               "of that deal. Make it faster.")
+
+
+BUDGET_ERROR = (f"Thinking budget used up: your bot used more than {THINK_S_PER_400:g} s of thinking time per 400 "
+                "deals in a fight, so it did nothing for the rest of that fight. Make it faster.")
+
+
+def is_budget(note: str) -> bool:
+    return "thinking budget" in note
 
 
 def is_slow(note: str) -> bool:
@@ -187,7 +272,10 @@ def smoke(sub) -> None:
         status, msg = "broken", "; ".join(problems)
     else:
         status = "ok"
-        msg = (TIME_ERROR if len(other) < len(problems) else "Loaded and played.") + \
+        # A call over 50 ms is the cause worth naming; the budget only when every call was in time.
+        per_call = any(is_slow(p) and not is_budget(p) for p in problems)
+        msg = (TIME_ERROR if per_call else BUDGET_ERROR if any(map(is_budget, problems)) else
+               "Loaded and played.") + \
             (" Problems: " + "; ".join(other) if other else "")
     with db() as con:
         con.execute("update subs set status=?, message=? where id=?", (status, msg[:2000], sub["id"]))
@@ -205,18 +293,57 @@ def claim(job) -> bool:
         return True
 
 
+RANDOM_FIRST = 3  # fights against random opponents before a new bot is matched by rating
+
+
+def live_ratings(ms, ids: set) -> dict[int, tuple[float, int]]:
+    """Each current entry's average live score so far and how many fights it is over (as on the board)."""
+    tot: dict[int, list] = {}
+    for m in ms:
+        if m["a"] in ids and m["b"] in ids:
+            for me, sc in ((m["a"], m["score_a"]), (m["b"], m["score_b"])):
+                t = tot.setdefault(me, [0.0, 0])
+                t[0] += sc or 0.0
+                t[1] += 1
+    return {i: (t[0] / t[1], t[1]) for i, t in tot.items()}
+
+
 def next_job():
     with db() as con:
         for s in con.execute("select * from subs where status = 'queued' order by id"):
             if claim(("smoke", s["id"])):
                 return ("smoke", s)
         es = entries(con)
-        done = {(m["a"], m["b"]) for m in con.execute("select a, b from matches where stage = 'live'")}
-    # Newest files first, so a fresh upload gets its results soonest.
-    for x in es:
-        for y in es:
-            if y["id"] < x["id"] and (y["id"], x["id"]) not in done and claim(("live", y["id"], x["id"])):
-                return ("live", y, x)
+        ms = con.execute("select a, b, score_a, score_b from matches where stage = 'live'").fetchall()
+    done = {(m["a"], m["b"]) for m in ms}
+    ids = {e["id"] for e in es}
+    rating = live_ratings(ms, ids)
+    # Everyone climbs together: the next fight goes to the bot with the fewest
+    # fights so far (running ones included), the longest-waiting on a tie. So a
+    # fresh upload starts first, but cannot starve other bots that are behind.
+    # Its opponents: three at random first, which places it without bias, then
+    # the bot whose current rating (its live score so far) is closest, working
+    # outward. Every pair is still played in the end, so a finished board means
+    # what it always did.
+    with BUSY_LOCK:
+        taken = done | {(j[1], j[2]) for j in BUSY if j[0] == "live"}
+    count = dict.fromkeys(ids, 0)
+    for a, b in taken:
+        if a in ids and b in ids:
+            count[a] += 1
+            count[b] += 1
+
+    def order(x, y):
+        shuffle = derive_seed("order", *sorted((x["id"], y["id"])))  # random, but stable between checks
+        if rating.get(x["id"], (0, 0))[1] < RANDOM_FIRST or y["id"] not in rating:
+            return (0 if rating.get(x["id"], (0, 0))[1] < RANDOM_FIRST else 2, 0.0, shuffle)
+        return (1, abs(rating[y["id"]][0] - rating[x["id"]][0]), shuffle)
+
+    for x in sorted(es, key=lambda e: (count[e["id"]], e["id"])):
+        for y in sorted((y for y in es if y["id"] != x["id"]), key=lambda y: order(x, y)):
+            lo, hi = sorted((x, y), key=lambda e: e["id"])  # stored older first, as before
+            if (lo["id"], hi["id"]) not in taken and claim(("live", lo["id"], hi["id"])):
+                return ("live", lo, hi)
     return None
 
 
@@ -231,7 +358,7 @@ def worker() -> None:
             if job[0] == "smoke":
                 smoke(job[1])
             else:
-                record("live", job[1], job[2], fight(job[1], job[2], DEALS, seed))
+                record("live", job[1], job[2], fight(job[1], job[2], DEALS, seed, keep_logs=True))
         except Exception as e:  # one bad fight must not stop the arena
             print(f"  ! job {job[0]} failed: {type(e).__name__}: {e}", flush=True)
         finally:
@@ -250,7 +377,7 @@ def run_final() -> None:
 
     def go(pair):
         a, b = pair
-        r = fight(a, b, FINAL_DEALS, seed)
+        r = fight(a, b, FINAL_DEALS, seed, keep_logs=True)
         record("final", a, b, r)
         print(f"  {a['team']} {r['score'][0]:+.2f}  vs  {b['team']} {r['score'][1]:+.2f}", flush=True)
 
@@ -270,7 +397,7 @@ def standings(stage: str) -> list[dict]:
             ids = {m["a"] for m in ms} | {m["b"] for m in ms}
             es = {r["id"]: dict(r) for r in con.execute(
                 f"select s.*, t.house from subs s join teams t on t.name = s.team "
-                f"where s.id in ({','.join('?' * len(ids))})", tuple(ids))} if ids else {}
+                f"where s.id in ({','.join('?' * len(ids))}) and not coalesce(t.dq, 0)", tuple(ids))} if ids else {}
     rows = {i: dict(e, total=0.0, weighted=0.0, deals=0, fights=0, wins=0) for i, e in es.items()}
     for m in ms:
         if m["a"] in rows and m["b"] in rows:
@@ -410,7 +537,88 @@ def fights_table(limit: int | None) -> str:
 <th>Bot</th><th class="n">Score</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"""
 
 
-def team_page(name: str) -> str | None:
+def log_link(stage: str, a: int, b: int) -> str:
+    """The links only show when this fight kept a log (fights from before logs existed have none)."""
+    if not log_path(stage, a, b).exists():
+        return '<span class="muted">no log</span>'
+    return (f'<a href="/log/{stage}/{a}/{b}.txt">Readable log</a> · '
+            f'<a href="/log/{stage}/{a}/{b}.jsonl.gz">Data</a>')
+
+
+def log_text(raw: bytes, stage: str) -> str:
+    """A fight's stored log as plain text to read: totals, then every deal written out."""
+    deals = [json.loads(line) for line in gzip.decompress(raw).decode("utf-8").splitlines()]
+    card = lambda c: f"{FACES.get(c % 13 + 1, c % 13 + 1)}{SUITS[c // 13]}"
+    cards = lambda cs: " ".join(map(card, cs))
+    names = deals[0]["names"]
+    tot = {n: {"pnl": 0.0, "peeks": 0, "swaps": 0, "paid": 0.0} for n in names}
+    pairs: dict = {}
+    for i, d in enumerate(deals):
+        for seat, n in enumerate(d["names"]):
+            tot[n]["pnl"] += d["pnl"][seat]
+            tot[n]["paid"] += d["spent"][seat]
+            pairs[(n, i // 2)] = pairs.get((n, i // 2), 0.0) + d["pnl"][seat]
+            for r in d["rounds"]:
+                mv = r["moves"][seat]
+                if mv:
+                    tot[n][mv["kind"] + "s"] += 1
+    out = [f"HIDDEN HAND - {stage} fight: {names[0]} vs {names[1]}",
+           f"{len(deals) // 2} deals, each played twice with the hands swapped ({len(deals)} plays).", ""]
+    for n in names:
+        ps = [p for (m, _), p in pairs.items() if m == n]
+        sc = sum(math.copysign(math.sqrt(abs(p)), p) for p in ps) / len(ps)
+        t = tot[n]
+        out.append(f"{n}: score {sc:+.3f}, PnL {t['pnl'] / len(deals):+.2f} per deal, {t['peeks']} peeks, "
+                   f"{t['swaps']} swaps, paid {t['paid']:g} for moves")
+    out += ["", "Cards: A=1 ... K=13. Taker buys at price + 2 or sells at price - 2. The stock settles at the sum of all 15 cards."]
+    for i, d in enumerate(deals):
+        n = d["names"]
+        out += ["", "=" * 78,
+                f"Deal {i // 2 + 1}, {'as dealt' if i % 2 == 0 else 'hands swapped'}",
+                f"  {n[0]} holds {cards(d['hands'][0])}   |   {n[1]} holds {cards(d['hands'][1])}",
+                f"  Board (face down): {cards(d['board'])}"]
+        for r in d["rounds"]:
+            up = cards(d["board"][:r["shown"]]) or "-"
+            out.append(f"  Round {r['round']}  (board up: {up})")
+            for seat, mv in enumerate(r["moves"]):
+                if mv and mv["kind"] == "peek":
+                    out.append(f"    {n[seat]} peeks: sees {card(mv['card'])}")
+                elif mv:
+                    out.append(f"    {n[seat]} swaps {card(mv['out'])} for {card(mv['in'])}")
+            for q in r["quotes"]:
+                mk, tk, px = n[q["maker"]], n[1 - q["maker"]], q["price"]
+                did = (f"buys {q['qty']} at {px + R.HALF_SPREAD:g}" if q["qty"] > 0 else
+                       f"sells {-q['qty']} at {px - R.HALF_SPREAD:g}" if q["qty"] < 0 else "passes")
+                out.append(f"    {mk} quotes {px:g}{' (no quote: house quoted for it)' if q['auto'] else ''}; {tk} {did}")
+        out.append(f"  Settles at {d['V']}:")
+        for seat in (0, 1):
+            out.append(f"    {n[seat]}: final hand {cards(d['final_hands'][seat])}, position {d['positions'][seat]:+d}, "
+                       f"paid {d['spent'][seat]:g}, PnL {d['pnl'][seat]:+.2f}")
+    return "\n".join(out) + "\n"
+
+
+LOG_FORMAT = """<p class="muted" style="margin:10px 0 0">Every deal of the fight, both ways round, one JSON object per
+line (gzipped). Read it with <code>[json.loads(l) for l in gzip.open(path, "rt")]</code>. Each deal has
+<code>names</code> (seat order), <code>hands</code>, <code>board</code>, <code>rounds</code> (each with
+<code>shown</code>, <code>moves</code> and <code>quotes</code>: maker seat, price, qty, auto), <code>V</code>,
+<code>final_hands</code>, <code>positions</code>, <code>spent</code> and <code>pnl</code>. Cards are numbered 0 to 51:
+rank = card % 13 + 1, suit = card // 13. <b>Readable log</b> is the same fight written out as plain text.
+Only the two teams in a fight can download its log.</p>"""
+
+
+def fight_log(team: str | None, stage: str, a: int, b: int) -> bytes | None:
+    """A fight's full log, for one of the two teams that played it and nobody else."""
+    if not team:
+        return None
+    with db() as con:
+        m = con.execute("""select sa.team ta, sb.team tb from matches m join subs sa on sa.id = m.a
+                           join subs sb on sb.id = m.b where stage = ? and a = ? and b = ?""",
+                        (stage, a, b)).fetchone()
+    p = log_path(stage, a, b)
+    return p.read_bytes() if m and team in (m["ta"], m["tb"]) and p.exists() else None
+
+
+def team_page(name: str, viewer: str | None = None) -> str | None:
     with db() as con:
         t = con.execute("select * from teams where name = ?", (name,)).fetchone()
         if not t:
@@ -423,6 +631,7 @@ def team_page(name: str) -> str | None:
         live_ids = {e["id"] for e in entries(con)}
     if not cur:
         return f"<h1>{esc(name)}</h1><p class='lede'>No working bot submitted yet.</p>"
+    own = viewer == name  # only a team looking at its own page sees its fight logs
     rows = []
     for m in ms:
         mine = m["a"] == cur["id"]
@@ -433,13 +642,15 @@ def team_page(name: str) -> str | None:
         sc = (m["score_a"] if mine else m["score_b"]) or 0.0
         rows.append((sc, f"""<tr><td>{team_link(opp)}</td><td class="n">{money(sc, 3)}</td>
 <td class="n">{money(pnl / m['deals'])}</td><td>{'<span class="tag ok">won</span>' if sc > 0 else '<span class="tag bad">lost</span>' if sc < 0 else '<span class="tag">drew</span>'}</td>
-<td><a href="/match/live/{m['a']}/{m['b']}">Watch</a></td></tr>"""))
+<td><a href="/match/live/{m['a']}/{m['b']}">Watch</a></td>{f"<td>{log_link('live', m['a'], m['b'])}</td>" if own else ''}</tr>"""))
     rows.sort(key=lambda r: -r[0])
-    body = "".join(r[1] for r in rows) or '<tr><td colspan="5" class="muted">Fights are being played. Check back in a minute.</td></tr>'
+    body = "".join(r[1] for r in rows) or \
+        f'<tr><td colspan="{6 if own else 5}" class="muted">Fights are being played. Check back in a minute.</td></tr>'
     return f"""<h1>{esc(name)}</h1>
 <p class="lede">Version {cur['version']}, submitted {when(cur['created'])}.</p>
 <h2>Head to head</h2><div class="scroll"><table><thead><tr><th>Opponent</th><th class="n">Score</th>
-<th class="n">PnL / deal</th><th>Result</th><th></th></tr></thead><tbody>{body}</tbody></table></div>"""
+<th class="n">PnL / deal</th><th>Result</th><th></th>{'<th></th>' if own else ''}</tr></thead><tbody>{body}</tbody></table></div>
+{LOG_FORMAT if own else ''}"""
 
 
 SUITS = "♠♥♦♣"
@@ -489,7 +700,7 @@ def deal_html(log: dict) -> str:
 <th class="n">Position</th><th class="n">Paid</th><th class="n">PnL</th></tr></thead><tbody>{final}</tbody></table></div>"""
 
 
-def match_page(stage: str, a: int, b: int) -> str | None:
+def match_page(stage: str, a: int, b: int, viewer: str | None = None) -> str | None:
     with db() as con:
         m = con.execute(
             """select m.*, sa.team ta, sb.team tb from matches m join subs sa on sa.id = m.a
@@ -503,7 +714,9 @@ def match_page(stage: str, a: int, b: int) -> str | None:
 <p class="lede">{esc(m['stage']).title()} fight, {m['deals']} deals.
 {team_link(m['ta'])} score {money(m['score_a'] or 0, 3)} ({money(m['pnl_a'] / m['deals'])} PnL per deal),
 {team_link(m['tb'])} score {money(m['score_b'] or 0, 3)} ({money(m['pnl_b'] / m['deals'])} PnL per deal).
-Below is the first deal, played both ways round: same cards, seats swapped.</p>{halves}"""
+Below is the first deal, played both ways round: same cards, seats swapped.</p>{(
+    f'<div class="panel" style="margin-top:18px"><b>Your fight.</b> Every deal: {log_link(stage, a, b)}'
+    f'{LOG_FORMAT}</div>') if viewer in (m['ta'], m['tb']) else ''}{halves}"""
 
 
 def submit_page(team: str | None, flash: str = "") -> str:
@@ -511,10 +724,11 @@ def submit_page(team: str | None, flash: str = "") -> str:
     if not team:
         reg = ("" if deadline_passed() else
                """<h2>New team</h2><div class="panel"><form method="post" action="/register">
+<input type="password" name="key" placeholder="Key from your mentor" autocomplete="off" required aria-label="Key from your mentor">
 <input type="text" name="name" placeholder="Team name" maxlength="40" required aria-label="Team name">
 <button>Register</button></form>
-<p class="muted" style="margin:10px 0 0">Register once per team. You get a key: keep it, and share it only with your
-teammates. It is how you log in from another laptop.</p></div>""")
+<p class="muted" style="margin:10px 0 0">Your mentor gives your team one key. Use it here once to name your team;
+after that it is your login. Share it only with your teammates.</p></div>""")
         return f"""<h1>Submit</h1>{msg}{reg}
 <h2>Already registered</h2><div class="panel"><form method="post" action="/login">
 <input type="password" name="key" placeholder="Team key" autocomplete="current-password" required aria-label="Team key">
@@ -527,10 +741,13 @@ teammates. It is how you log in from another laptop.</p></div>""")
             for m in con.execute("select * from matches where stage = 'live' and (a = ? or b = ?)", (cur["id"], cur["id"])):
                 side = 0 if m["a"] == cur["id"] else 1
                 for k, v in json.loads(m["notes"])[side].items():
-                    k = TIME_ERROR if is_slow(k) else k
+                    k = BUDGET_ERROR if is_budget(k) else TIME_ERROR if is_slow(k) else k
                     notes[k] = notes.get(k, 0) + v
     closed = deadline_passed()
-    form = ('<p class="muted">Uploads are closed.</p>' if closed else
+    with db() as con:
+        dq = con.execute("select dq from teams where name = ?", (team,)).fetchone()["dq"]
+    form = ('<p class="neg">Your team is disqualified. Talk to the organisers.</p>' if dq else
+            '<p class="muted">Uploads are closed.</p>' if closed else
             f"""<form method="post" action="/submit" enctype="multipart/form-data">
 <input type="file" name="bot" accept=".py" required aria-label="Bot file"><button>Upload</button></form>
 <p class="muted" style="margin:10px 0 0">One .py file, under {MAX_BYTES // 1000} KB. One upload every {COOLDOWN // 60} minutes;
@@ -539,10 +756,10 @@ files that fail the check do not count. Your newest working file is your entry.<
         f"""<tr><td>#{s['id']}</td><td class="muted">{when(s['created'])}</td>
 <td><span class="tag {'ok' if s['status'] == 'ok' else 'bad' if s['status'] in ('rejected', 'broken') else ''}">{esc(s['status'])}</span>
 {'<span class="tag ok">entry</span>' if cur and s['id'] == cur['id'] else ''}
-{'<span class="tag bad">time limit</span>' if s['message'].startswith(TIME_ERROR) else ''}</td>
+{'<span class="tag bad">time limit</span>' if s['message'].startswith((TIME_ERROR, BUDGET_ERROR)) else ''}</td>
 <td style="white-space:normal">{esc(s['message'])}</td></tr>""" for s in subs) \
         or '<tr><td colspan="4" class="muted">Nothing uploaded yet.</td></tr>'
-    issues = "".join(f"<li{' class=neg' if k == TIME_ERROR else ''}>{esc(k)} <span class='muted'>×{v}</span></li>"
+    issues = "".join(f"<li{' class=neg' if k in (TIME_ERROR, BUDGET_ERROR) else ''}>{esc(k)} <span class='muted'>×{v}</span></li>"
                      for k, v in notes.items())
     issues_html = (f"<h2>Problems in your fights</h2><div class='panel'><ul style='margin:0'>{issues}</ul>"
                    "<p class='muted' style='margin:8px 0 0'>Only your team sees this.</p></div>") if issues else ""
@@ -551,11 +768,37 @@ files that fail the check do not count. Your newest working file is your entry.<
 {issues_html}
 <h2>Your uploads</h2><div class="scroll"><table><thead><tr><th>File</th><th>When</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>{hist}</tbody></table></div>
-<p>{team_link(team)} · your public results</p>"""
+<p>{team_link(team)} · your results, and full logs of every fight you played</p>"""
+
+
+# Wrong keys across the whole site, not per address: behind nginx and a tunnel the
+# client address is not trustworthy. Logged-in teams use their cookie and never hit this.
+WRONG_KEYS: list[float] = []
+WRONG_KEYS_LOCK = threading.Lock()
+WRONG_KEYS_PER_MIN = 20
+
+
+def guesses_left() -> bool:
+    with WRONG_KEYS_LOCK:
+        WRONG_KEYS[:] = [t for t in WRONG_KEYS if time.time() - t < 60]
+        return len(WRONG_KEYS) < WRONG_KEYS_PER_MIN
+
+
+def wrong_key() -> None:
+    with WRONG_KEYS_LOCK:
+        WRONG_KEYS.append(time.time())
 
 
 def deadline_passed() -> bool:
     return bool(DEADLINE) and datetime.now() >= datetime.fromisoformat(DEADLINE)
+
+
+def cooldown_left(con, team: str) -> float:
+    """Seconds until the team may upload again. Rejected files and uploads before an organiser reset don't count."""
+    last = con.execute("select max(s.created) from subs s join teams t on t.name = s.team where s.team = ? "
+                       "and s.status != 'rejected' and s.created > coalesce(t.cooldown_from, 0)",
+                       (team,)).fetchone()[0]
+    return max(0.0, COOLDOWN - (time.time() - last)) if last else 0.0
 
 
 def accept_upload(team: str, raw: bytes) -> str:
@@ -567,11 +810,11 @@ def accept_upload(team: str, raw: bytes) -> str:
     except UnicodeDecodeError:
         return "That file is not UTF-8 text. Upload your .py file."
     with db() as con:
-        last = con.execute("select max(created) from subs where team = ? and status != 'rejected'",
-                           (team,)).fetchone()[0]
-        if last and time.time() - last < COOLDOWN:
-            wait = int(COOLDOWN - (time.time() - last)) // 60 + 1
-            return f"One upload every {COOLDOWN // 60} minutes. Try again in about {wait} min."
+        if con.execute("select dq from teams where name = ?", (team,)).fetchone()["dq"]:
+            return "Your team is disqualified. Talk to the organisers."
+        left = cooldown_left(con, team)
+        if left:
+            return f"One upload every {COOLDOWN // 60} minutes. Try again in about {int(left) // 60 + 1} min."
         cur = con.execute("insert into subs(team, created, file, status) values(?,?,?,?)",
                           (team, time.time(), "", "checking"))
         sid = cur.lastrowid
@@ -585,6 +828,164 @@ def accept_upload(team: str, raw: bytes) -> str:
     with db() as con:
         con.execute("update subs set file=?, status=?, message=? where id=?", (str(path), status, msg, sid))
     return f"File #{sid}: {msg}"
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ADMIN  (organisers only, at /admin, behind ADMIN_KEY)
+# ════════════════════════════════════════════════════════════════════
+
+ADMIN_CSS = """<style>
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tile b{display:block;font-size:26px;color:var(--mint)}
+td form{display:inline-flex;gap:6px;flex-wrap:nowrap;margin:2px 0}
+td input[type=text]{flex:0 1 140px;padding:5px 8px;min-width:90px}
+button.sm{padding:5px 10px;font-size:11px}button.danger{background:var(--down);color:#fff}
+tr.dq td{opacity:.55}
+pre{overflow:auto;background:var(--sunken);border:1px solid var(--line);border-radius:10px;padding:14px;
+font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
+</style>"""
+
+
+def admin_form(do: str, label: str, cls: str = "", confirm: str = "", **fields) -> str:
+    hidden = "".join(f'<input type="hidden" name="{k}" value="{esc(str(v))}">' for k, v in fields.items())
+    ask = f' onclick="return confirm(\'{esc(confirm)}\')"' if confirm else ""
+    return (f'<form method="post" action="/admin/action"><input type="hidden" name="do" value="{do}">{hidden}'
+            f'<button class="sm {cls}"{ask}>{esc(label)}</button></form>')
+
+
+def admin_login_page(flash: str = "") -> str:
+    msg = f'<p class="flash">{esc(flash)}</p>' if flash else ""
+    return f"""<h1>Admin</h1>{msg}<div class="panel"><form method="post" action="/admin/login">
+<input type="password" name="key" placeholder="Admin key" autocomplete="current-password" required aria-label="Admin key">
+<button>Log in</button></form></div>"""
+
+
+def admin_page(flash: str = "") -> str:
+    with db() as con:
+        teams = con.execute("""select t.*, (select mentor from team_keys k where k.team = t.name) as mentor
+                               from teams t where not t.house order by lower(t.name)""").fetchall()
+        subs = con.execute("select * from subs order by id desc").fetchall()
+        es = entries(con)
+        ids = {e["id"] for e in es}
+        done = sum(1 for m in con.execute("select a, b from matches where stage = 'live'")
+                   if m["a"] in ids and m["b"] in ids)
+        mentors = con.execute("select mentor, count(*) as n, count(team) as used from team_keys "
+                              "group by mentor order by mentor").fetchall()
+        cool = {t["name"]: cooldown_left(con, t["name"]) for t in teams}
+    board = {r["team"]: (i, r) for i, r in enumerate((r for r in standings("live") if not r["house"]), 1)}
+    entry = {e["team"]: e for e in es}
+    by_team: dict = {}
+    for s in subs:
+        by_team.setdefault(s["team"], []).append(s)
+    with BUSY_LOCK:
+        running = len(BUSY)
+    pending = len(ids) * (len(ids) - 1) // 2 - done
+    queued = sum(s["status"] in ("queued", "checking") for s in subs)
+
+    tiles = "".join(f'<div class="panel tile"><b>{v}</b>{k}</div>' for k, v in (
+        ("teams", len(teams)), ("disqualified", sum(t["dq"] for t in teams)), ("uploads", len(subs)),
+        ("waiting for first check", queued), ("live fights still to play", pending), ("jobs running now", running)))
+
+    trows = []
+    for t in teams:
+        n = t["name"]
+        mine = by_team.get(n, [])
+        rank = board.get(n)
+        e = entry.get(n)
+        trows.append(f"""<tr class="{'dq' if t['dq'] else ''}"><td>{team_link(n)}{' <span class="tag bad">DQ</span>' if t['dq'] else ''}</td>
+<td>{esc(t['mentor'] or '-')}</td><td><code>{esc(t['key'] or '')}</code></td>
+<td class="n">{f"#{rank[0]} · {rank[1]['score']:+.3f}" if rank and rank[1]['deals'] else '-'}</td>
+<td>{f"#{e['id']} (v{e['version']})" if e else '<span class="muted">none</span>'}</td>
+<td class="n">{len(mine)}</td><td class="muted">{when(mine[0]['created']) if mine else '-'}</td>
+<td class="n">{f"{int(cool[n]) // 60 + 1} min" if cool[n] else '-'}</td>
+<td>{admin_form('reinstate', 'Reinstate', team=n) if t['dq'] else
+     admin_form('dq', 'Disqualify', 'danger', f'Disqualify {n}? They leave the board and get no new fights.', team=n)}
+{admin_form('cooldown', 'Reset cooldown', team=n) if cool[n] else ''}
+<form method="post" action="/admin/action"><input type="hidden" name="do" value="rename"><input type="hidden" name="team" value="{esc(n)}">
+<input type="text" name="name" placeholder="New name" maxlength="40" required aria-label="New name for {esc(n)}"><button class="sm">Rename</button></form></td></tr>""")
+
+    srows = "".join(f"""<tr><td>#{s['id']}</td><td>{esc(s['team'])}</td><td class="muted">{when(s['created'])}</td>
+<td><span class="tag {'ok' if s['status'] == 'ok' else 'bad' if s['status'] in ('rejected', 'broken') else ''}">{esc(s['status'])}</span></td>
+<td style="white-space:normal;min-width:260px">{esc(s['message'][:300])}</td>
+<td><a href="/admin/sub/{s['id']}">Code</a></td>
+<td>{'' if s['team'].startswith('House') or s['status'] == 'ok' else admin_form('recheck', 'Recheck', sub=s['id'])}</td></tr>""" for s in subs)
+
+    mrows = "".join(f"<tr><td>{esc(m['mentor'])}</td><td class='n'>{m['used']} / {m['n']}</td></tr>" for m in mentors)
+    msg = f'<p class="flash">{esc(flash)}</p>' if flash else ""
+    return f"""{ADMIN_CSS}<h1>Admin</h1>{msg}
+<p class="lede">Organisers only. <a href="/admin/logout">Log out</a>. Run the final from the server:
+<code>docker compose exec arena python arena.py final</code></p>
+<h2>Status</h2><div class="tiles">{tiles}</div>
+<h2>Teams</h2><div class="scroll"><table><thead><tr><th>Team</th><th>Mentor</th><th>Key</th><th class="n">Live rank</th>
+<th>Entry</th><th class="n">Uploads</th><th>Last upload</th><th class="n">Cooldown</th><th>Actions</th></tr></thead>
+<tbody>{''.join(trows) or '<tr><td colspan="9" class="muted">No teams yet.</td></tr>'}</tbody></table></div>
+<h2>Mentor keys used</h2><div class="scroll"><table><thead><tr><th>Mentor</th><th class="n">Claimed</th></tr></thead>
+<tbody>{mrows or '<tr><td colspan="2" class="muted">No keys loaded.</td></tr>'}</tbody></table></div>
+<h2>Submissions</h2><div class="scroll"><table><thead><tr><th>File</th><th>Team</th><th>When</th><th>Status</th>
+<th>Message</th><th></th><th></th></tr></thead><tbody>{srows}</tbody></table></div>"""
+
+
+def admin_code_page(sid: int) -> str | None:
+    with db() as con:
+        s = con.execute("select * from subs where id = ?", (sid,)).fetchone()
+    if not s:
+        return None
+    try:
+        code = sub_path(s).read_text(encoding="utf-8") if s["file"] else "(no file stored)"
+    except OSError as e:
+        code = f"(cannot read the file: {e})"
+    return f"""{ADMIN_CSS}<h1>File #{s['id']}</h1>
+<p class="lede">{team_link(s['team'])}, uploaded {when(s['created'])}, status {esc(s['status'])}.
+<a href="/admin">Back to admin</a></p><pre>{esc(code)}</pre>"""
+
+
+def admin_action(form: dict) -> str:
+    """Apply one organiser action. Returns the message to show."""
+    get = lambda k: form.get(k, [""])[0].strip()
+    do, team = get("do"), get("team")
+    if do in ("dq", "reinstate", "cooldown"):
+        with db() as con:
+            sql = ("update teams set cooldown_from = ? where name = ? and not house" if do == "cooldown" else
+                   "update teams set dq = ? where name = ? and not house")
+            ok = con.execute(sql, (time.time() if do == "cooldown" else int(do == "dq"), team)).rowcount
+        if not ok:
+            return f"No team called {team}."
+        return {"dq": f"{team} is disqualified: off the board, no new fights, no uploads.",
+                "reinstate": f"{team} is reinstated.",
+                "cooldown": f"{team} can upload again now."}[do]
+    if do == "rename":
+        new = " ".join(get("name").split())
+        if not re.fullmatch(r"[\w .&'-]{2,40}", new) or new.lower().startswith("house"):
+            return "Team names are 2 to 40 letters, digits, spaces or . & ' - _ (and cannot start with House)."
+        try:
+            with db() as con:
+                if not con.execute("update teams set name = ? where name = ? and not house", (new, team)).rowcount:
+                    return f"No team called {team}."
+                con.execute("update subs set team = ? where team = ?", (new, team))
+                con.execute("update team_keys set team = ? where team = ?", (new, team))
+        except sqlite3.IntegrityError:
+            return f"{new} is already taken."
+        return f"{team} is now {new}."
+    if do == "recheck":
+        with db() as con:
+            s = con.execute("select * from subs where id = ?", (int(get("sub") or 0),)).fetchone()
+        if not s or s["team"].startswith("House") or not s["file"]:
+            return "No such uploaded file."
+        if s["status"] == "ok":  # requeueing a working entry would take it off the board until retested
+            return f"File #{s['id']} already works; nothing to recheck."
+        if not claim(("smoke", s["id"])):
+            return f"File #{s['id']} is being tested right now. Try again in a minute."
+        try:
+            res = check_source(sub_path(s))
+            msg = "Rechecked, queued for its first fights." if res.ok else "; ".join(res.errors)
+            with db() as con:
+                con.execute("update subs set status = ?, message = ? where id = ?",
+                            ("queued" if res.ok else "rejected", msg, s["id"]))
+        finally:
+            with BUSY_LOCK:
+                BUSY.discard(("smoke", s["id"]))
+        return f"File #{s['id']}: {msg}"
+    return "Unknown action."
 
 
 def kit_zip() -> bytes:
@@ -621,6 +1022,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             row = con.execute("select name from teams where key = ? and house = 0", (key,)).fetchone()
         return row["name"] if row else None
 
+    def is_admin(self) -> bool:
+        c = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        return bool(ADMIN_KEY) and "hh_admin" in c and secrets.compare_digest(c["hh_admin"].value.encode(), ADMIN_KEY.encode())
+
+    def send_admin(self, title: str, body: str, status: int = 200) -> None:
+        self.send(shell(f"{title} · Hidden Hand", body), status,
+                  headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
+
     def send(self, body: str | bytes, status: int = 200, ctype: str = "text/html; charset=utf-8",
              headers: dict | None = None) -> None:
         data = body.encode() if isinstance(body, str) else body
@@ -645,6 +1054,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         team = self.team()
         if path == "/":
             return self.send(shell("Hidden Hand", home(), team))
+        if ADMIN_KEY and path in ("/admin", "/admin/logout") or path.startswith("/admin/sub/") and self.is_admin():
+            if path == "/admin/logout":
+                return self.redirect("/admin", "hh_admin=; Path=/admin; Max-Age=0")
+            if not self.is_admin():
+                return self.send_admin("Admin", admin_login_page(q.get("m", [""])[0]))
+            if path == "/admin":
+                return self.send_admin("Admin", admin_page(q.get("m", [""])[0]))
+            body = admin_code_page(int(path.rsplit("/", 1)[1])) if path.rsplit("/", 1)[1].isdigit() else None
+            if body:
+                return self.send_admin("File", body)
         if path == "/fights":
             return self.send(shell("Fights · Hidden Hand", f"<h1>Fights</h1>{fights_table(None)}", team))
         if path == "/submit":
@@ -657,12 +1076,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/rules":
             return self.send((HERE / "README.md").read_bytes(), ctype="text/plain; charset=utf-8")
         if path.startswith("/team/"):
-            body = team_page(path[6:])
+            body = team_page(path[6:], team)
             if body:
                 return self.send(shell(f"{path[6:]} · Hidden Hand", body, team))
+        m = re.fullmatch(r"/log/(live|final)/(\d+)/(\d+)\.(jsonl\.gz|txt)", path)
+        log = fight_log(team, m[1], int(m[2]), int(m[3])) if m else None
+        if log:
+            name = f"hiddenhand-{m[1]}-{m[2]}-{m[3]}.{m[4]}"
+            if m[4] == "txt":  # made from the stored log on each click; nothing extra is kept
+                log = log_text(log, m[1]).encode("utf-8")
+            return self.send(log, ctype="text/plain; charset=utf-8" if m[4] == "txt" else "application/gzip",
+                             headers={"Cache-Control": "private, no-store",
+                                      "Content-Disposition": f'attachment; filename="{name}"'})
         m = re.fullmatch(r"/match/(live|final)/(\d+)/(\d+)", path)
         if m:
-            body = match_page(m[1], int(m[2]), int(m[3]))
+            body = match_page(m[1], int(m[2]), int(m[3]), team)
             if body:
                 return self.send(shell("Fight · Hidden Hand", body, team))
         self.send(shell("Not found", "<h1>Not found</h1>", team), 404)
@@ -672,32 +1100,68 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if n > MAX_BYTES + 10_000:
             return self.redirect("/submit?m=" + urllib.parse.quote(f"Files must be under {MAX_BYTES // 1000} KB."))
         raw = self.rfile.read(n)
+        forms = ("/login", "/register", "/admin/login", "/admin/action")
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace")) if self.path in forms else {}
+        key = form.get("key", [""])[0].strip()
+        if self.path in forms[:3] and not guesses_left():
+            back = "/admin?m=" if self.path == "/admin/login" else "/submit?m="
+            return self.redirect(back + urllib.parse.quote(
+                "Too many wrong keys on the site just now. Wait a minute and try again."))
+        if ADMIN_KEY and self.path == "/admin/login":
+            if not secrets.compare_digest(key.encode(), ADMIN_KEY.encode()):
+                wrong_key()
+                print("  admin: wrong key", flush=True)
+                return self.redirect("/admin?m=" + urllib.parse.quote("That admin key is not right."))
+            return self.redirect("/admin", f"hh_admin={ADMIN_KEY}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=43200")
+        if ADMIN_KEY and self.path == "/admin/action":
+            if not self.is_admin():
+                return self.redirect("/admin")
+            note = admin_action(form)
+            print(f"  admin: {form.get('do', [''])[0]} {form.get('team', form.get('sub', ['']))[0]}: {note}",
+                  flush=True)  # audit trail for scripts/logs.sh
+            return self.redirect("/admin?m=" + urllib.parse.quote(note))
         if self.path == "/login":
-            key = urllib.parse.parse_qs(raw.decode("utf-8", "replace")).get("key", [""])[0].strip()
+            # Keys are matched ignoring case; the cookie carries the key exactly as stored.
             with db() as con:
-                ok = key and con.execute("select 1 from teams where key = ? and house = 0", (key,)).fetchone()
-            if not ok:
+                row = key and con.execute("select key from teams where key = ? collate nocase and house = 0",
+                                          (key,)).fetchone()
+            if not row:
+                wrong_key()
                 return self.redirect("/submit?m=" + urllib.parse.quote("That key is not right."))
-            return self.redirect("/submit", f"hh_key={key}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600")
+            return self.redirect("/submit", f"hh_key={row['key']}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600")
         if self.path == "/register":
-            # ponytail: open sign-up, no rate limit; a spammer's empty teams never reach the board or fight
-            name = " ".join(urllib.parse.parse_qs(raw.decode("utf-8", "replace")).get("name", [""])[0].split())
+            name = " ".join(form.get("name", [""])[0].split())
             if deadline_passed():
                 return self.redirect("/submit?m=" + urllib.parse.quote("Registration is closed."))
             if not re.fullmatch(r"[\w .&'-]{2,40}", name) or name.lower().startswith("house"):
                 return self.redirect("/submit?m=" + urllib.parse.quote(
                     "Team names are 2 to 40 letters, digits, spaces or . & ' - _ (and cannot start with House)."))
-            key = secrets.token_urlsafe(9)
             try:
                 with db() as con:
-                    con.execute("insert into teams(name, key) values(?, ?)", (name, key))
-            except sqlite3.IntegrityError:
+                    # Claim first, so two teams racing for one key cannot both get it.
+                    claimed = key and con.execute("update team_keys set team = ? where key = ? collate nocase"
+                                                  " and team is null", (name, key)).rowcount
+                    if claimed:
+                        key = con.execute("select key from team_keys where key = ? collate nocase",
+                                          (key,)).fetchone()["key"]
+                        con.execute("insert into teams(name, key) values(?, ?)", (name, key))
+                    else:
+                        used = key and con.execute("select team from team_keys where key = ? collate nocase",
+                                                   (key,)).fetchone()
+            except sqlite3.IntegrityError:  # rolled back: the key stays unclaimed
                 return self.redirect("/submit?m=" + urllib.parse.quote(
                     f"{name} is taken. If that is your team, log in with your key."))
+            if not claimed:
+                if used:
+                    return self.redirect("/submit?m=" + urllib.parse.quote(
+                        f"That key already belongs to {used['team']}. Log in with it below."))
+                wrong_key()
+                return self.redirect("/submit?m=" + urllib.parse.quote(
+                    "That key is not right. Your mentor has your team's key."))
             print(f"  + team {name}", flush=True)  # audit trail for scripts/logs.sh
             return self.redirect("/submit?m=" + urllib.parse.quote(
-                f"Registered. Your team key is {key} . Save it and send it to your teammates: "
-                "it is the only way to log in again."),
+                f"Registered {name}. Your key {key} is now your login: keep it and share it only with "
+                "your teammates."),
                 f"hh_key={key}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600")
         if self.path == "/submit":
             team = self.team()
@@ -746,6 +1210,20 @@ def main() -> int:
         with db() as con:
             for t in con.execute("select * from teams where house = 0 order by name"):
                 print(f"{t['name']}: {t['key']}")
+        return 0
+    if args[:1] == ["load-keys"] and len(args) == 2:
+        import csv
+        f = sys.stdin if args[1] == "-" else open(args[1], encoding="utf-8", newline="")
+        rows = [r for r in csv.reader(f) if len(r) == 2 and [c.strip().lower() for c in r] != ["mentor", "key"]]
+        with db() as con:
+            added = sum(con.execute("insert or ignore into team_keys(key, mentor) values(?, ?)",
+                                    (k.strip(), m.strip())).rowcount for m, k in rows)
+        print(f"{added} new keys added ({len(rows) - added} already there)")
+        return 0
+    if args[:1] == ["keys"]:
+        with db() as con:
+            for k in con.execute("select * from team_keys order by mentor, key"):
+                print(f"{k['mentor']},{k['key']},{k['team'] or ''}")
         return 0
     if args[:1] == ["final"]:
         run_final()

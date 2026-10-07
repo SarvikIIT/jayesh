@@ -354,7 +354,7 @@ class SandboxedBot:
     """
 
     def __init__(self, path: str | Path, name: str,
-                 fresh_process_per_deal: bool = False):
+                 fresh_process_per_deal: bool = False, budget_s: float | None = None):
         self.path = Path(path)
         self.name = name
         self.source = self.path.read_text(encoding="utf-8")
@@ -365,6 +365,12 @@ class SandboxedBot:
         #: Why the submission could not be loaded for a deal, if it could not.
         self.load_errors: list[str] = []
         self.fresh_process_per_deal = fresh_process_per_deal
+        # Thinking time for the whole fight: the bot's own compute, summed over
+        # every call and every Bot() it builds. Once it is spent the bot does
+        # nothing for the rest of the fight, so one slow bot cannot hold a
+        # fight (and the server) for minutes.
+        self.budget_s = budget_s
+        self.used_s = 0.0
         self._deal_index = 0
         # Set when the worker had to be killed. A replacement worker has no
         # bot instance and no per-deal state, so the bot is out for the rest
@@ -638,9 +644,12 @@ class SandboxedBot:
         # bot might lean on is reproducible across reruns without being the
         # same stream in every pairing.
         state_seed = derive_seed("deal-state", self.path.name, self._deal_index)
+        if self._out_of_budget():
+            return self  # no Bot is built; every call this deal is refused below
         try:
             tampered = self._rpc(("new_deal", state_seed),
                                  timeout_s=max(10.0, self._deadline_s))
+            self._charge()
             for name in (tampered or ()):
                 self.tampering.append(name)
         except (BotTimeout, SandboxError, RuntimeError) as e:
@@ -655,6 +664,13 @@ class SandboxedBot:
                 self.load_errors.append(reason)
         return self
 
+    def _out_of_budget(self) -> bool:
+        return self.budget_s is not None and self.used_s >= self.budget_s
+
+    def _charge(self) -> None:
+        if self.last_call_ms:
+            self.used_s += self.last_call_ms / 1000
+
     def _call_remote(self, method: str, *args):
         if self._dead_this_deal:
             # Do not pay another IPC round trip to a worker we already know
@@ -662,7 +678,14 @@ class SandboxedBot:
             # action it would get from a fresh timeout.
             self.last_call_ms = None
             raise BotTimeout(f"{self.name}: out for this deal after a timeout")
-        return self._rpc(("call", method, args), self._deadline_s)
+        if self._out_of_budget():
+            self.last_call_ms = None
+            raise BotTimeout(f"{self.name}: used its {self.budget_s:g} s thinking budget for this fight")
+        self.last_call_ms = None  # charge only this call's time, never a stale one
+        try:
+            return self._rpc(("call", method, args), self._deadline_s)
+        finally:
+            self._charge()
 
     def move(self, obs):
         return self._call_remote("move", obs)

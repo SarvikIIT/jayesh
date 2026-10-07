@@ -21,8 +21,21 @@ services:
       FINAL_DEALS: ${FINAL_DEALS:-500}
       COOLDOWN: ${COOLDOWN:-600}
       WORKERS: ${WORKERS:-3}
+      # Every fight in its own container: no network, read-only, no mounts.
+      # Peak use is WORKERS x MATCH_MEMORY, so size these to the VM.
+      MATCH_ISOLATION: docker
+      MATCH_IMAGE: hiddenhand-arena:latest
+      MATCH_MEMORY: ${MATCH_MEMORY:-2g}
+      MATCH_CPUS: ${MATCH_CPUS:-4}
+    # Docker-outside-Docker: the arena drives the host daemon to start fight
+    # containers. The socket is root on the host, so only the arena gets it;
+    # bot code never runs in this container. DOCKER_GID is the socket's group
+    # (scripts/deploy.sh fills it in), letting the unprivileged arena user use it.
+    group_add:
+      - "${DOCKER_GID:-999}"
     volumes:
       - hh-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8000" # reachable only via nginx, never published to the host
     restart: unless-stopped

@@ -201,17 +201,20 @@ def play_deal(bot0, bot1, seed: int, names=("seat0", "seat1")) -> dict:
 
 
 def play_match(make_a, make_b, n_deals: int = 100, seed: int = 0,
-               names=("a", "b"), mirror: bool = True) -> dict:
+               names=("a", "b"), mirror: bool = True, keep_logs: bool = False) -> dict:
     """n_deals deals (each twice when mirrored). make_x() gives a fresh bot per deal.
 
     Returns totals, per-deal PnL for bot a, merged notes, and the replay of
     the first deal (both seatings) so a match can be watched afterwards.
+    With keep_logs, also "logs": the replay log of every deal, in play order.
+    Keeping them changes nothing about how the deals are played.
     """
     total = [0.0, 0.0]
     per_deal: list[float] = []
     per_deal_b: list[float] = []
     notes: list[dict] = [{}, {}]
     replays: list[dict] = []
+    logs: list[dict] = []
     for d in range(n_deals):
         s = derive_seed(seed, d)
         for swap in ((False, True) if mirror else (False,)):
@@ -231,9 +234,14 @@ def play_match(make_a, make_b, n_deals: int = 100, seed: int = 0,
                     into[k] = into.get(k, 0) + v
             if d == 0:
                 replays.append(res["log"])
-    return {"pnl": total, "per_deal": per_deal, "notes": notes,
-            "replays": replays, "deals": len(per_deal),
-            "score": [score(per_deal, mirror), score(per_deal_b, mirror)]}
+            if keep_logs:
+                logs.append(res["log"])
+    out = {"pnl": total, "per_deal": per_deal, "notes": notes,
+           "replays": replays, "deals": len(per_deal),
+           "score": [score(per_deal, mirror), score(per_deal_b, mirror)]}
+    if keep_logs:
+        out["logs"] = logs
+    return out
 
 
 def score(per_deal: list[float], mirror: bool = True) -> float:

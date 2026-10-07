@@ -1,7 +1,12 @@
-# Hidden Hand arena. Bots run as an unprivileged user inside this container.
+# Hidden Hand arena. Each fight runs in its own throwaway container of this image
+# (match_runner.py), as an unprivileged user, with no network and a read-only root.
 FROM python:3.12-slim
 # python:3.12-slim already ships zoneinfo, so TZ is honoured with no extra packages.
 RUN useradd --create-home arena && mkdir /data && chown arena:arena /data
+# Docker CLI only (no daemon): the arena starts one container per fight on the
+# HOST's daemon through the socket docker-compose.yml mounts. Fight containers
+# use this same image and get no socket.
+COPY --from=docker:28-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
 COPY --chown=root:root . .
 USER arena

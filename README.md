@@ -291,7 +291,9 @@ No. Only the standard-library modules listed above. The game is small enough not
 **How fast must my bot be?**
 Aim for a millisecond or two per call. A call over 50 ms counts as doing nothing for that
 action, and a call that runs far over or never returns puts your bot out for the rest of that
-deal. The arena flags it on your upload as a **time limit** error. Your laptop may be faster
+deal. On top of that, each bot gets **30 seconds of thinking time per 400 deals** in a fight (a live fight
+is 200 deals both ways round = 400 deals: 30 s; the final's 1,000 deals: 75 s). Once that is used up, your
+bot does nothing for the rest of that fight. The arena flags both on your upload as a **time limit** error. Your laptop may be faster
 than the arena machine, so leave a wide margin.
 
 **Why did my live rank change when I did not upload anything?**

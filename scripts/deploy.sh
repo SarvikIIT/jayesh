@@ -14,6 +14,23 @@ if [[ ! -f .env ]]; then
   echo "created .env from .env.example -- set DEADLINE before the event."
 fi
 
+# The arena runs as a non-root user and needs the docker socket's group to start fight containers.
+# Kept in .env so a later plain `docker compose up` uses it too.
+DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
+if grep -q '^DOCKER_GID=' .env; then
+  sed -i "s/^DOCKER_GID=.*/DOCKER_GID=${DOCKER_GID}/" .env
+else
+  printf '\n# Group of /var/run/docker.sock (set by scripts/deploy.sh).\nDOCKER_GID=%s\n' "${DOCKER_GID}" >> .env
+fi
+
+# Organiser panel at /admin. Made once; read it back with: grep ADMIN_KEY .env
+if ! grep -q '^ADMIN_KEY=.' .env; then
+  sed -i '/^ADMIN_KEY=/d' .env
+  printf '\n# Key for the organiser panel at /admin (set by scripts/deploy.sh).\nADMIN_KEY=%s\n' \
+    "$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')" >> .env
+  echo "created an admin key for /admin -- see: grep ADMIN_KEY .env"
+fi
+
 echo "==> building arena image"
 docker compose build arena
 

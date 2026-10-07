@@ -7,6 +7,7 @@ __pycache__/
 .env.*
 # Team keys must never bake into image layers.
 keys.txt
+keys.csv
 teams.txt
 # Participant kit needs docs/participant_ps.pdf; nothing else from docs/.
 Hidden_Hand_Event_Plan_and_PS.pdf
